@@ -7,8 +7,22 @@ on:
       - main
       - master
     paths:
+      # Run automatically when a committed source ZIP changes.
       - '**/*.zip'
-      - '.github/workflows/build-latest-stores.yml'
+
+      # Run automatically when Flutter source files are edited directly.
+      - '**/lib/**'
+      - '**/assets/**'
+      - '**/test/**'
+      - '**/integration_test/**'
+      - '**/tool/**'
+      - '**/android/**'
+      - '**/pubspec.yaml'
+      - '**/pubspec.lock'
+      - '**/analysis_options.yaml'
+
+      # Run automatically after this workflow is edited or replaced.
+      - '.github/workflows/**'
   schedule:
     # Runs hourly to remove outputs and workflow runs older than one hour.
     - cron: '17 * * * *'
@@ -90,19 +104,36 @@ jobs:
               sys.exit(1)
 
           timestamp, selected = max(candidates, key=lambda item: (item[0], item[1]))
+          import hashlib
+
+          selected_path = pathlib.Path(selected)
+          sha256 = hashlib.sha256()
+          with selected_path.open('rb') as source:
+              for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                  sha256.update(chunk)
+          digest = sha256.hexdigest()
+
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               output.write(f'path={selected}\n')
               output.write(f'commit_timestamp={timestamp}\n')
+              output.write(f'sha256={digest}\n')
+
+          log_dir = pathlib.Path(os.environ['RUNNER_TEMP']) / 'build-logs'
+          log_dir.mkdir(parents=True, exist_ok=True)
+          (log_dir / 'selected-zip.txt').write_text(
+              selected + '\n',
+              encoding='utf-8',
+          )
+          (log_dir / 'selected-zip-sha256.txt').write_text(
+              f'{digest}  {selected}\n',
+              encoding='utf-8',
+          )
 
           print(f'Selected ZIP: {selected}')
           print(f'Latest commit timestamp: {timestamp}')
+          print(f'SHA-256: {digest}')
           PY
           } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
-
-          printf '%s\n' "${{ steps.latest_zip.outputs.path }}" \
-            > "$RUNNER_TEMP/build-logs/selected-zip.txt"
-          sha256sum "${{ steps.latest_zip.outputs.path }}" \
-            > "$RUNNER_TEMP/build-logs/selected-zip-sha256.txt"
 
       - name: Validate and extract selected ZIP
         id: project
@@ -627,3 +658,4 @@ jobs:
                 "repos/$GITHUB_REPOSITORY/actions/runs/$ID"
             fi
           done
+ 
