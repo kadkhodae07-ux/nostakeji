@@ -1,0 +1,629 @@
+name: Build Latest Flutter ZIP - Bazaar and Myket
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**/*.zip'
+      - '.github/workflows/build-latest-stores.yml'
+  schedule:
+    # Runs hourly to remove outputs and workflow runs older than one hour.
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nostalgia-club-store-build
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.27.4'
+  SUCCESS_ARTIFACT_NAME: nostalgia-club-bazaar-myket
+  ERROR_ARTIFACT_NAME: nostalgia-club-error-log
+
+jobs:
+  build:
+    name: Build two store APKs
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Prepare diagnostic directory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/build-logs"
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_number=$GITHUB_RUN_NUMBER"
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "sha=$GITHUB_SHA"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$RUNNER_TEMP/build-logs/context.txt"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find latest committed ZIP
+        id: latest_zip
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            python3 <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          raw = subprocess.check_output(
+              ['git', 'ls-files', '-z', '--', '*.zip'],
+          )
+          paths = [
+              pathlib.Path(item.decode('utf-8'))
+              for item in raw.split(b'\0')
+              if item
+          ]
+
+          candidates = []
+          for path in paths:
+              if not path.is_file():
+                  continue
+              timestamp_raw = subprocess.check_output(
+                  ['git', 'log', '-1', '--format=%ct', '--', str(path)],
+                  text=True,
+              ).strip()
+              timestamp = int(timestamp_raw or '0')
+              candidates.append((timestamp, str(path)))
+
+          if not candidates:
+              print('No tracked ZIP file was found in the repository.', file=sys.stderr)
+              sys.exit(1)
+
+          timestamp, selected = max(candidates, key=lambda item: (item[0], item[1]))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'path={selected}\n')
+              output.write(f'commit_timestamp={timestamp}\n')
+
+          print(f'Selected ZIP: {selected}')
+          print(f'Latest commit timestamp: {timestamp}')
+          PY
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+          printf '%s\n' "${{ steps.latest_zip.outputs.path }}" \
+            > "$RUNNER_TEMP/build-logs/selected-zip.txt"
+          sha256sum "${{ steps.latest_zip.outputs.path }}" \
+            > "$RUNNER_TEMP/build-logs/selected-zip-sha256.txt"
+
+      - name: Validate and extract selected ZIP
+        id: project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            SOURCE_ZIP="$GITHUB_WORKSPACE/${{ steps.latest_zip.outputs.path }}"
+            EXTRACT_DIR="$RUNNER_TEMP/flutter-source"
+
+            unzip -tq "$SOURCE_ZIP"
+            rm -rf "$EXTRACT_DIR"
+            mkdir -p "$EXTRACT_DIR"
+            unzip -q "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+
+            python3 <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'flutter-source'
+          candidates = []
+
+          for pubspec in root.rglob('pubspec.yaml'):
+              project = pubspec.parent
+              if '.dart_tool' in project.parts or 'build' in project.parts:
+                  continue
+              has_main = (project / 'lib' / 'main.dart').is_file()
+              depth = len(project.relative_to(root).parts)
+              candidates.append((not has_main, depth, str(project)))
+
+          if not candidates:
+              print('No Flutter project with pubspec.yaml was found in the selected ZIP.', file=sys.stderr)
+              sys.exit(1)
+
+          _, _, selected = min(candidates)
+          selected_path = pathlib.Path(selected)
+          if not (selected_path / 'lib' / 'main.dart').is_file():
+              print('The selected project does not contain lib/main.dart.', file=sys.stderr)
+              sys.exit(1)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'root={selected_path}\n')
+
+          print(f'Flutter project root: {selected_path}')
+          PY
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            flutter --version
+            dart --version
+            java -version
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Generate Android project when absent
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            if [[ -d android ]]; then
+              echo 'Existing Android project detected; bootstrap skipped.'
+            elif [[ -f tool/bootstrap_android.sh ]]; then
+              chmod +x tool/bootstrap_android.sh
+              ./tool/bootstrap_android.sh
+            else
+              PROJECT_NAME="$(python3 - <<'PY'
+          import pathlib
+          import re
+          text = pathlib.Path('pubspec.yaml').read_text(encoding='utf-8')
+          match = re.search(r'^name:\s*([a-zA-Z0-9_]+)\s*$', text, re.MULTILINE)
+          print(match.group(1) if match else 'flutter_app')
+          PY
+              )"
+              flutter create \
+                --platforms=android \
+                --org=com.example \
+                --project-name="$PROJECT_NAME" \
+                .
+            fi
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Add Bazaar and Myket product flavors
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            python3 <<'PY'
+          from pathlib import Path
+          import sys
+
+          kts = Path('android/app/build.gradle.kts')
+          groovy = Path('android/app/build.gradle')
+
+          if kts.is_file():
+              path = kts
+              text = path.read_text(encoding='utf-8')
+              if 'create("bazaar")' not in text and 'create("myket")' not in text:
+                  text += r'''
+
+          // Store flavors added by GitHub Actions.
+          android {
+              flavorDimensions += "store"
+              productFlavors {
+                  create("bazaar") {
+                      dimension = "store"
+                      resValue("string", "distribution_store", "bazaar")
+                  }
+                  create("myket") {
+                      dimension = "store"
+                      resValue("string", "distribution_store", "myket")
+                  }
+              }
+          }
+          '''
+                  path.write_text(text, encoding='utf-8')
+              elif not ('create("bazaar")' in text and 'create("myket")' in text):
+                  print('Only one required store flavor exists in build.gradle.kts.', file=sys.stderr)
+                  sys.exit(1)
+              print(f'Configured flavors in {path}')
+          elif groovy.is_file():
+              path = groovy
+              text = path.read_text(encoding='utf-8')
+              if 'bazaar {' not in text and 'myket {' not in text:
+                  text += r'''
+
+          // Store flavors added by GitHub Actions.
+          android {
+              flavorDimensions "store"
+              productFlavors {
+                  bazaar {
+                      dimension "store"
+                      resValue "string", "distribution_store", "bazaar"
+                  }
+                  myket {
+                      dimension "store"
+                      resValue "string", "distribution_store", "myket"
+                  }
+              }
+          }
+          '''
+                  path.write_text(text, encoding='utf-8')
+              elif not ('bazaar {' in text and 'myket {' in text):
+                  print('Only one required store flavor exists in build.gradle.', file=sys.stderr)
+                  sys.exit(1)
+              print(f'Configured flavors in {path}')
+          else:
+              print('Neither build.gradle.kts nor build.gradle exists.', file=sys.stderr)
+              sys.exit(1)
+          PY
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Configure optional release signing
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          {
+            if [[ -n "${KEYSTORE_BASE64:-}" ]]; then
+              if [[ -z "${KEY_ALIAS:-}" || -z "${KEY_PASSWORD:-}" || -z "${STORE_PASSWORD:-}" ]]; then
+                echo 'Keystore was supplied, but one or more signing secrets are missing.' >&2
+                exit 1
+              fi
+
+              KEYSTORE_PATH="$RUNNER_TEMP/upload-keystore.jks"
+              printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+              chmod 600 "$KEYSTORE_PATH"
+
+              {
+                echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH"
+                echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+                echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+                echo "ANDROID_STORE_PASSWORD=$STORE_PASSWORD"
+              } >> "$GITHUB_ENV"
+
+              python3 <<'PY'
+          from pathlib import Path
+          import sys
+
+          kts = Path('android/app/build.gradle.kts')
+          groovy = Path('android/app/build.gradle')
+
+          if kts.is_file():
+              path = kts
+              text = path.read_text(encoding='utf-8')
+              marker = '// Optional CI release signing.'
+              if marker not in text:
+                  text += r'''
+
+          // Optional CI release signing.
+          android {
+              signingConfigs {
+                  maybeCreate("ciRelease").apply {
+                      storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH"))
+                      storePassword = System.getenv("ANDROID_STORE_PASSWORD")
+                      keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                      keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("ciRelease")
+                  }
+              }
+          }
+          '''
+                  path.write_text(text, encoding='utf-8')
+          elif groovy.is_file():
+              path = groovy
+              text = path.read_text(encoding='utf-8')
+              marker = '// Optional CI release signing.'
+              if marker not in text:
+                  text += r'''
+
+          // Optional CI release signing.
+          android {
+              signingConfigs {
+                  ciRelease {
+                      storeFile file(System.getenv("ANDROID_KEYSTORE_PATH"))
+                      storePassword System.getenv("ANDROID_STORE_PASSWORD")
+                      keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                      keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.ciRelease
+                  }
+              }
+          }
+          '''
+                  path.write_text(text, encoding='utf-8')
+          else:
+              print('Android Gradle file was not found.', file=sys.stderr)
+              sys.exit(1)
+          PY
+              echo 'Release signing configured from repository secrets.'
+            else
+              echo 'Signing secrets are not configured; the project default signing configuration will be used.'
+            fi
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Resolve dependencies and generate code
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            flutter pub get
+            if grep -Eq '^\s*build_runner:' pubspec.yaml; then
+              dart run build_runner build --delete-conflicting-outputs
+            fi
+            if [[ -d test ]]; then
+              dart format lib test
+            else
+              dart format lib
+            fi
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Run structural checks
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            if [[ -f tool/quality_check.py ]]; then
+              python3 tool/quality_check.py
+            else
+              echo 'No custom structural checker found; skipped.'
+            fi
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Analyze and test
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            flutter analyze --fatal-warnings
+            if [[ -d test ]]; then
+              flutter test --reporter expanded
+            else
+              echo 'No test directory found; tests skipped.'
+            fi
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Build Bazaar APK
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            flutter build apk \
+              --release \
+              --flavor bazaar \
+              --dart-define=STORE=bazaar \
+              --dart-define=APP_ENV=release \
+              --dart-define=MOCK_MODE=false
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Build Myket APK
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            flutter build apk \
+              --release \
+              --flavor myket \
+              --dart-define=STORE=myket \
+              --dart-define=APP_ENV=release \
+              --dart-define=MOCK_MODE=false
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Prepare exactly two APK files
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            OUTPUT_DIR="$RUNNER_TEMP/final-output"
+            rm -rf "$OUTPUT_DIR"
+            mkdir -p "$OUTPUT_DIR"
+
+            BAZAAR_APK="$(find build/app/outputs/flutter-apk -maxdepth 1 -type f \
+              -name '*bazaar*release*.apk' | sort | head -n 1)"
+            MYKET_APK="$(find build/app/outputs/flutter-apk -maxdepth 1 -type f \
+              -name '*myket*release*.apk' | sort | head -n 1)"
+
+            if [[ -z "$BAZAAR_APK" || ! -f "$BAZAAR_APK" ]]; then
+              echo 'Bazaar release APK was not found.' >&2
+              exit 1
+            fi
+            if [[ -z "$MYKET_APK" || ! -f "$MYKET_APK" ]]; then
+              echo 'Myket release APK was not found.' >&2
+              exit 1
+            fi
+
+            cp "$BAZAAR_APK" "$OUTPUT_DIR/nostalgia-club-bazaar.apk"
+            cp "$MYKET_APK" "$OUTPUT_DIR/nostalgia-club-myket.apk"
+
+            unzip -tq "$OUTPUT_DIR/nostalgia-club-bazaar.apk"
+            unzip -tq "$OUTPUT_DIR/nostalgia-club-myket.apk"
+
+            APK_COUNT="$(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')"
+            FILE_COUNT="$(find "$OUTPUT_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+
+            if [[ "$APK_COUNT" != '2' || "$FILE_COUNT" != '2' ]]; then
+              echo "Final output must contain exactly two APKs; found files=$FILE_COUNT apks=$APK_COUNT" >&2
+              find "$OUTPUT_DIR" -maxdepth 1 -type f -printf '%f\n' >&2
+              exit 1
+            fi
+
+            sha256sum "$OUTPUT_DIR"/*.apk | tee "$RUNNER_TEMP/build-logs/apk-sha256.txt"
+            ls -lh "$OUTPUT_DIR"/*.apk
+          } 2>&1 | tee -a "$RUNNER_TEMP/build-logs/build.log"
+
+      - name: Upload one ZIP containing only two APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SUCCESS_ARTIFACT_NAME }}
+          path: |
+            ${{ runner.temp }}/final-output/nostalgia-club-bazaar.apk
+            ${{ runner.temp }}/final-output/nostalgia-club-myket.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Capture failure information
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo
+            echo '===== FAILURE CONTEXT ====='
+            echo "failed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "workflow=$GITHUB_WORKFLOW"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_number=$GITHUB_RUN_NUMBER"
+            echo "sha=$GITHUB_SHA"
+            echo
+            echo '===== DISK ====='
+            df -h
+            echo
+            echo '===== PROJECT FILES ====='
+            if [[ -n "${{ steps.project.outputs.root }}" && -d "${{ steps.project.outputs.root }}" ]]; then
+              find "${{ steps.project.outputs.root }}" -maxdepth 3 -type f | sort | head -n 500
+            fi
+          } >> "$RUNNER_TEMP/build-logs/build.log" 2>&1
+
+      - name: Upload error log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ERROR_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/build-logs/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 1
+
+  cleanup:
+    name: Remove old outputs and old run history
+    if: always()
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Delete store artifacts older than one hour, keep newest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          CUTOFF="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+          mapfile -t ARTIFACTS < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.name == env.SUCCESS_ARTIFACT_NAME or .name == env.ERROR_ARTIFACT_NAME) | [.id, .created_at, .name] | @tsv' \
+              | sort -t $'\t' -k2,2r
+          )
+
+          if [[ "${#ARTIFACTS[@]}" -eq 0 ]]; then
+            echo 'No matching artifacts exist.'
+            exit 0
+          fi
+
+          LATEST_ID="${ARTIFACTS[0]%%$'\t'*}"
+          echo "Keeping newest artifact id=$LATEST_ID"
+
+          for ROW in "${ARTIFACTS[@]:1}"; do
+            IFS=$'\t' read -r ID CREATED_AT NAME <<< "$ROW"
+            if [[ "$CREATED_AT" < "$CUTOFF" || "$CREATED_AT" == "$CUTOFF" ]]; then
+              echo "Deleting old artifact id=$ID name=$NAME created_at=$CREATED_AT"
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID"
+            else
+              echo "Artifact id=$ID is younger than one hour; keeping until the next cleanup."
+            fi
+          done
+
+      - name: Delete completed workflow runs older than one hour
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          CUTOFF="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+          WORKFLOW_PATH="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
+          WORKFLOW_PATH="${WORKFLOW_PATH%@*}"
+
+          WORKFLOW_ID="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
+              --jq ".workflows[] | select(.path == \"$WORKFLOW_PATH\") | .id" \
+              | head -n 1
+          )"
+
+          if [[ -z "$WORKFLOW_ID" ]]; then
+            echo "Workflow id was not found for path: $WORKFLOW_PATH"
+            exit 0
+          fi
+
+          mapfile -t RUNS < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?per_page=100" \
+              --jq '.workflow_runs[] | [.id, .created_at, .status, .event] | @tsv' \
+              | sort -t $'\t' -k2,2r
+          )
+
+          LATEST_BUILD_ID=''
+          for ROW in "${RUNS[@]}"; do
+            IFS=$'\t' read -r ID CREATED_AT STATUS EVENT <<< "$ROW"
+            if [[ "$EVENT" != 'schedule' ]]; then
+              LATEST_BUILD_ID="$ID"
+              break
+            fi
+          done
+
+          echo "Keeping current run id=$GITHUB_RUN_ID"
+          echo "Keeping latest build run id=${LATEST_BUILD_ID:-none}"
+
+          for ROW in "${RUNS[@]}"; do
+            IFS=$'\t' read -r ID CREATED_AT STATUS EVENT <<< "$ROW"
+
+            if [[ "$ID" == "$GITHUB_RUN_ID" || "$ID" == "$LATEST_BUILD_ID" ]]; then
+              continue
+            fi
+            if [[ "$STATUS" != 'completed' ]]; then
+              continue
+            fi
+            if [[ "$CREATED_AT" < "$CUTOFF" || "$CREATED_AT" == "$CUTOFF" ]]; then
+              echo "Deleting old workflow run id=$ID event=$EVENT created_at=$CREATED_AT"
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$ID"
+            fi
+          done
